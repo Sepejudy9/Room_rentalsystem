@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 import uuid
 import firebase_admin
@@ -114,75 +114,93 @@ def calculate_balance(tenant_id, report_month):
 
 
 # --- UI SECTIONS ---
-
 def show_dashboard():
-    """Displays the main dashboard with financial summaries and charts."""
-    st.title("📊 Dashboard")
-    st.markdown("---")
+    """Displays the main dashboard with KPIs and charts."""
+    st.header("Financial Dashboard")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", datetime.now().date() - relativedelta(years=1))
-    with col2:
-        end_date = st.date_input("End Date", datetime.now().date())
+    # --- Date Range Filter ---
+    today = datetime.now()
+    start_of_year = date(today.year, 1, 1)
+    
+    date_range = st.date_input(
+        "Select Date Range for Report",
+        (start_of_year, today.date()),
+        key='dashboard_date_range'
+    )
 
-    payments_df = pd.DataFrame(st.session_state.get('payments', []))
-    expenses_df = pd.DataFrame(st.session_state.get('expenses', []))
+    if len(date_range) != 2:
+        st.warning("Please select a valid start and end date.")
+        return
 
+    start_date, end_date = date_range
+    
+    # Ensure data is loaded
+    if 'tenants' not in st.session_state or 'payments' not in st.session_state or 'expenses' not in st.session_state:
+        st.info("Data is loading or not yet available.")
+        return
+
+    # Filter data based on the selected date range
+    payments_df = pd.DataFrame(st.session_state.payments)
+    expenses_df = pd.DataFrame(st.session_state.expenses)
+
+    # Convert date columns to datetime objects for comparison
     if not payments_df.empty:
-        payments_df['date'] = pd.to_datetime(payments_df['date'])
-        filtered_payments = payments_df[
-            (payments_df['date'].dt.date >= start_date) & (payments_df['date'].dt.date <= end_date)
-        ]
-        total_income = filtered_payments['amount'].sum()
+        payments_df['date'] = pd.to_datetime(payments_df['date']).dt.date
+        filtered_payments = payments_df[(payments_df['date'] >= start_date) & (payments_df['date'] <= end_date)]
     else:
-        total_income = 0
+        filtered_payments = pd.DataFrame(columns=['date', 'amount'])
 
     if not expenses_df.empty:
-        expenses_df['date'] = pd.to_datetime(expenses_df['date'])
-        filtered_expenses = expenses_df[
-            (expenses_df['date'].dt.date >= start_date) & (expenses_df['date'].dt.date <= end_date)
-        ]
-        total_expenses = filtered_expenses['amount'].sum()
+        expenses_df['date'] = pd.to_datetime(expenses_df['date']).dt.date
+        filtered_expenses = expenses_df[(expenses_df['date'] >= start_date) & (expenses_df['date'] <= end_date)]
     else:
-        total_expenses = 0
-        
+        filtered_expenses = pd.DataFrame(columns=['date', 'amount'])
+    
+    # --- KPIs ---
+    total_income = filtered_payments['amount'].sum()
+    total_expenses = filtered_expenses['amount'].sum()
     net_income = total_income - total_expenses
-
-    st.subheader("Financial Overview")
-    kpi_cols = st.columns(3)
-    kpi_cols[0].metric("Total Income", f"AED {total_income:,.2f}", delta_color="normal")
-    kpi_cols[1].metric("Total Expenses", f"AED {total_expenses:,.2f}", delta_color="inverse")
-    kpi_cols[2].metric("Net Income", f"AED {net_income:,.2f}", delta=f"{net_income - (total_income - total_expenses):,.2f}")
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Income", f"AED {total_income:,.2f}")
+    col2.metric("Total Expenses", f"AED {total_expenses:,.2f}")
+    col3.metric("Net Income", f"AED {net_income:,.2f}")
 
     st.markdown("---")
 
+    # --- Monthly Net Income Chart ---
     st.subheader("Monthly Net Income")
-    if not payments_df.empty or not expenses_df.empty:
-        date_range = pd.date_range(start=start_date, end=end_date, freq='MS')
-        monthly_summary = pd.DataFrame(index=date_range)
-        
-        if not payments_df.empty:
-            monthly_income = filtered_payments.set_index('date').resample('MS')['amount'].sum()
-            monthly_summary = monthly_summary.join(monthly_income.rename('Income'))
 
-        if not expenses_df.empty:
-            monthly_expenses = filtered_expenses.set_index('date').resample('MS')['amount'].sum()
-            monthly_summary = monthly_summary.join(monthly_expenses.rename('Expenses'))
-        
-        monthly_summary = monthly_summary.fillna(0)
-        monthly_summary['Net Income'] = monthly_summary['Income'] - monthly_summary['Expenses']
-
-        st.line_chart(monthly_summary[['Income', 'Expenses', 'Net Income']])
-        
-        st.write("Monthly Summary Data")
-        st.dataframe(monthly_summary.style.format({
-            "Income": "AED {:,.2f}",
-            "Expenses": "AED {:,.2f}",
-            "Net Income": "AED {:,.2f}"
-        }))
+    # Prepare data for chart
+    if not filtered_payments.empty:
+        filtered_payments['Month'] = pd.to_datetime(filtered_payments['date']).dt.to_period('M').astype(str)
+        income_summary = filtered_payments.groupby('Month').agg(Income=('amount', 'sum')).reset_index()
     else:
-        st.info("No financial data available for the selected period.")
+        income_summary = pd.DataFrame(columns=['Month', 'Income'])
+
+    if not filtered_expenses.empty:
+        filtered_expenses['Month'] = pd.to_datetime(filtered_expenses['date']).dt.to_period('M').astype(str)
+        expense_summary = filtered_expenses.groupby('Month').agg(Expenses=('amount', 'sum')).reset_index()
+    else:
+        expense_summary = pd.DataFrame(columns=['Month', 'Expenses'])
+
+    # *** FIX: Use an outer merge and fill NaNs to prevent KeyError ***
+    if not income_summary.empty or not expense_summary.empty:
+        monthly_summary = pd.merge(income_summary, expense_summary, on='Month', how='outer')
+        # Fill NaN values with 0 for months that have income but no expenses, or vice versa
+        monthly_summary['Income'] = monthly_summary['Income'].fillna(0)
+        monthly_summary['Expenses'] = monthly_summary['Expenses'].fillna(0)
+        
+        # Calculate Net Income
+        monthly_summary['Net Income'] = monthly_summary['Income'] - monthly_summary['Expenses']
+        
+        # Sort by month to ensure the chart is chronological
+        monthly_summary = monthly_summary.sort_values('Month')
+
+        st.bar_chart(monthly_summary.set_index('Month')['Net Income'])
+    else:
+        st.info("No income or expense data available for the selected period to display a chart.")
+
 
 def manage_tenants():
     st.title("👥 Tenant Management")
@@ -192,6 +210,7 @@ def manage_tenants():
             name = st.text_input("Full Name")
             property_unit = st.text_input("Property/Unit")
             rent = st.number_input("Monthly Rent Amount", min_value=0.0, format="%.2f")
+            deposit = st.number_input("Deposit Amount", min_value=0.0, format="%.2f")
             start_date = st.date_input("Lease Start Date", datetime.now().date())
             
             submitted = st.form_submit_button("Add Tenant")
@@ -200,7 +219,8 @@ def manage_tenants():
                     with st.spinner("Adding new tenant..."):
                         new_tenant_data = {
                             'name': name, 'property': property_unit, 'rent': rent,
-                            'start_date': start_date.strftime('%Y-%m-%d')
+                            'start_date': start_date.strftime('%Y-%m-%d'),
+                            'deposit': deposit
                         }
                         update_time, doc_ref = db.collection('tenants').add(new_tenant_data)
                         new_tenant_data['id'] = doc_ref.id
@@ -226,18 +246,26 @@ def manage_tenants():
             for i, tenant in enumerate(filtered_tenants):
                 with st.container():
                     st.markdown(f"#### {tenant['name']} ({tenant['property']})")
-                    cols = st.columns([2, 2, 1, 1])
+                    cols = st.columns([2, 2, 2, 1, 1])
                     cols[0].text(f"Monthly Rent: AED {tenant['rent']:,.2f}")
-                    cols[1].text(f"Start Date: {tenant['start_date']}")
+                    cols[1].text(f"Deposit: AED {tenant.get('deposit', 0.0):,.2f}")
+                    cols[2].text(f"Start Date: {tenant['start_date']}")
                     
-                    if cols[2].button("✏️ Edit", key=f"edit_{tenant['id']}"):
+                    if cols[3].button("✏️ Edit", key=f"edit_{tenant['id']}"):
                         st.session_state.edit_tenant_id = tenant['id']
 
-                    if cols[3].button("🗑️ Delete", key=f"delete_{tenant['id']}"):
+                    if cols[4].button("🗑️ Delete", key=f"delete_{tenant['id']}"):
                         if db:
                             with st.spinner("Deleting tenant..."):
                                 db.collection('tenants').document(tenant['id']).delete()
+                                # Also delete associated payments
+                                payments_to_delete = db.collection('payments').where('tenant_id', '==', tenant['id']).stream()
+                                for p in payments_to_delete:
+                                    p.reference.delete()
+                                
                                 st.session_state.tenants = [t for t in st.session_state.tenants if t['id'] != tenant['id']]
+                                st.session_state.payments = [p for p in st.session_state.payments if p['tenant_id'] != tenant['id']]
+                            st.success(f"Tenant {tenant['name']} and all associated payments have been deleted.")
                             st.rerun()
                 
                 if st.session_state.get('edit_tenant_id') == tenant['id']:
@@ -246,6 +274,7 @@ def manage_tenants():
                         new_name = st.text_input("Name", value=tenant['name'])
                         new_property = st.text_input("Property", value=tenant['property'])
                         new_rent = st.number_input("Rent", value=tenant['rent'], format="%.2f")
+                        new_deposit = st.number_input("Deposit Amount", value=tenant.get('deposit', 0.0), format="%.2f")
                         new_start_date = st.date_input("Start Date", value=datetime.strptime(tenant['start_date'], '%Y-%m-%d').date())
 
                         save_col, cancel_col = st.columns(2)
@@ -253,7 +282,8 @@ def manage_tenants():
                             with st.spinner("Saving changes..."):
                                 updated_data = {
                                     'name': new_name, 'property': new_property, 'rent': new_rent,
-                                    'start_date': new_start_date.strftime('%Y-%m-%d')
+                                    'start_date': new_start_date.strftime('%Y-%m-%d'),
+                                    'deposit': new_deposit
                                 }
                                 if db:
                                     db.collection('tenants').document(tenant['id']).update(updated_data)
@@ -277,7 +307,13 @@ def manage_payments():
     with st.expander("💰 Record New Payment", expanded=True):
         with st.form("new_payment_form", clear_on_submit=True):
             tenant_options = {t['id']: f"{t['name']} ({t['property']})" for t in st.session_state.tenants}
-            tenant_id = st.selectbox("Select Tenant", options=list(tenant_options.keys()), format_func=lambda x: tenant_options[x])
+            tenant_id = st.selectbox(
+                "Select Tenant",
+                options=list(tenant_options.keys()),
+                format_func=lambda x: tenant_options[x],
+                index=None,
+                placeholder="Select a tenant..."
+            )
             
             payment_date = st.date_input("Payment Date", datetime.now().date())
             amount = st.number_input("Amount Paid", min_value=0.01, format="%.2f")
@@ -298,6 +334,54 @@ def manage_payments():
 
     st.markdown("---")
     
+    st.subheader("Monthly Payment Report")
+    report_month = st.date_input("Select Month for Report", datetime.now().date(), key="report_month_selector")
+    report_month_str = report_month.strftime('%Y-%m')
+
+    all_payments = st.session_state.get('payments', [])
+    payments_in_month = [
+        p for p in all_payments
+        if datetime.strptime(p['date'], '%Y-%m-%d').strftime('%Y-%m') == report_month_str
+    ]
+    
+    total_collected = sum(p['amount'] for p in payments_in_month)
+    st.metric(f"Total Rent Collected in {report_month.strftime('%B %Y')}", f"AED {total_collected:,.2f}")
+
+    st.write("#### Tenants Who Paid This Month")
+    
+    # Group payments by tenant to handle multiple payments
+    payments_by_tenant = {}
+    for payment in payments_in_month:
+        tenant_id = payment['tenant_id']
+        if tenant_id not in payments_by_tenant:
+            payments_by_tenant[tenant_id] = []
+        payments_by_tenant[tenant_id].append(payment)
+
+    if not payments_by_tenant:
+        st.info("No payments were recorded for this month.")
+    else:
+        # Create a list of tenant info for sorting and display
+        tenant_report_list = []
+        for tenant_id, payments in payments_by_tenant.items():
+            tenant = get_tenant_by_id(tenant_id)
+            if tenant:
+                tenant_report_list.append({
+                    'name': tenant['name'],
+                    'property': tenant['property'],
+                    'payments': sorted(payments, key=lambda x: x['date']) # Sort payments by date
+                })
+
+        # Display sorted tenant list
+        for tenant_info in sorted(tenant_report_list, key=lambda x: x['name']):
+            total_paid_by_tenant = sum(p['amount'] for p in tenant_info['payments'])
+            st.markdown(f"- **{tenant_info['name']}** ({tenant_info['property']}) - Total Paid: AED {total_paid_by_tenant:,.2f}")
+            # Display each individual payment with its date
+            for payment in tenant_info['payments']:
+                 st.markdown(f"  - `Paid AED {payment['amount']:,.2f} on {payment['date']}`")
+
+
+    st.markdown("---")
+    
     st.subheader("Tenant Balances & History")
     
     tenant_options = {t['id']: f"{t['name']} ({t['property']})" for t in st.session_state.get('tenants', [])}
@@ -305,7 +389,14 @@ def manage_payments():
         st.info("No tenants to display.")
         return
 
-    view_tenant_id = st.selectbox("View History for Tenant", options=list(tenant_options.keys()), format_func=lambda x: tenant_options[x], key="view_tenant")
+    view_tenant_id = st.selectbox(
+        "View History for Tenant",
+        options=list(tenant_options.keys()),
+        format_func=lambda x: tenant_options[x],
+        key="view_tenant",
+        index=None,
+        placeholder="Select a tenant to view history..."
+    )
     report_month_dt = st.date_input("View Balance for Month", datetime.now().date(), key="view_month")
     
     if view_tenant_id:
@@ -383,25 +474,45 @@ def manage_expenses():
 # --- AUTHENTICATION AND APP LOGIC ---
 def show_login_form():
     """Displays the login form."""
-    st.title("Admin Login")
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
+    # Custom CSS for rounded corners on the image
+    st.markdown("""
+        <style>
+            .login-img img {
+                border-radius: 15px;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # Use columns to center the form and make it smaller
+    col1, col2, col3 = st.columns([1, 1, 1])
+
+    with col2:
+        # Wrap image in a div to apply the class
+        st.markdown('<div class="login-img">', unsafe_allow_html=True)
+        st.image("logo.jpg", use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
         
-        if submitted:
-            try:
-                admin_user = st.secrets["admin_credentials"]["username"]
-                admin_pass = st.secrets["admin_credentials"]["password"]
-                
-                if username == admin_user and password == admin_pass:
-                    st.session_state.authenticated = True
-                    st.rerun()
-                else:
-                    st.error("The username or password you entered is incorrect.")
-            except Exception as e:
-                st.error("Admin credentials are not configured correctly in secrets.toml.")
-                st.error(e)
+        st.markdown("<h1 style='text-align: center;'>Beth Room Rental</h1>", unsafe_allow_html=True)
+        st.markdown("<h3 style='text-align: center;'>Admin Login</h3>", unsafe_allow_html=True)
+        
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login")
+            
+            if submitted:
+                try:
+                    admin_user = st.secrets["admin_credentials"]["username"]
+                    admin_pass = st.secrets["admin_credentials"]["password"]
+                    
+                    if username == admin_user and password == admin_pass:
+                        st.session_state.authenticated = True
+                        st.rerun() # Re-added to fix the "double enter" bug by forcing an immediate script rerun.
+                    else:
+                        st.error("The username or password you entered is incorrect.")
+                except Exception as e:
+                    st.error("Admin credentials are not configured correctly in secrets.toml.")
+                    st.error(e)
 
 def show_main_app():
     """Shows the main application pages after successful login."""
@@ -437,7 +548,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
